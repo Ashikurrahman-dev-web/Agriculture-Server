@@ -68,12 +68,6 @@ app.post('/api/aiAnswer', async (req, res) => {
 
 app.post("/api/soil", async (req, res) => {
   try {
-    console.log("SOIL REQUEST BODY:", req.body);
-    console.log(
-      "SOIL CONTENT TYPE:",
-      req.headers["content-type"]
-    );
-
     const { imageUrl, language = "bn" } = req.body;
 
     if (!imageUrl) {
@@ -208,64 +202,10 @@ app.get("/api/soil/history", async (req,res) => {
   }
 });
 
-const { GoogleGenAI } = require("@google/genai");
-
-const ai = new GoogleGenAI({
-  apiKey: process.env.GEMINI_API_KEY,
-});
-
-// Sleep Helper
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-// Gemini Diagnosis with Retry + Fallback
-async function generateDiagnosis(requestData) {
-  const models = [
-    "gemini-3.8-flash",
-    "gemini-3.7-flash",
-    "gemini-3.6-flash",
-    "gemini-3.5-flash-lite",
-  ];
-
-  let lastError = null;
-  for (const model of models) {
-    const maxRetries = 1;
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
-      try {
-        console.log(`Gemini ${model} - attempt ${attempt}`);
-        const response = await ai.models.generateContent({
-          ...requestData,
-          model,
-        });
-        console.log(`Gemini diagnosis successful with: ${model}`);
-        return response;
-      } catch (error) {
-        lastError = error;
-  console.error(`Gemini ${model} attempt ${attempt} failed:`, error.message);
-        if (error.status === 429) {
-          console.log(`${model} returned 429. Moving to fallback model...`);
-          break;
-        }
-        if (error.status === 503) {
-          if (attempt === maxRetries) {
-            console.log(`${model} is still busy. Moving to fallback model...`);
-            break;
-          }
-          const delay = 1500 * Math.pow(2, attempt - 1);
-          console.log(`Retrying ${model} in ${delay / 1000} seconds...`);
-          await sleep(delay);
-          continue;
-        }
-        throw error;
-      }
-    }
-  }
-  throw lastError || new Error("All Gemini models failed");
-}
-
-// AI Crop Disease Diagnosis
 app.post("/api/diagnose", async (req, res) => {
   try {
-    const { imageUrl, language = "bn" } = req.body;
+
+    const { imageUrl, language = "bn" } = req.body ;
 
     if (!imageUrl) {
       return res.status(400).json({
@@ -274,6 +214,7 @@ app.post("/api/diagnose", async (req, res) => {
       });
     }
 
+    // Optimize Cloudinary image
     const fastImageUrl = imageUrl.replace(
       "/upload/",
       "/upload/w_600,q_auto,f_auto/"
@@ -281,114 +222,113 @@ app.post("/api/diagnose", async (req, res) => {
 
     console.log("Optimized image URL:", fastImageUrl);
 
-    const imageResponse = await fetch(fastImageUrl);
+    const responseLanguage =
+      language === "bn" ? "Bengali (Bangla)" : "English";
 
-    if (!imageResponse.ok) {
-      throw new Error("Could not download image from Cloudinary");
-    }
-
-    const imageBuffer = Buffer.from(await imageResponse.arrayBuffer());
-    const mimeType = imageResponse.headers.get("content-type") || "image/jpeg";
-    const base64Image = imageBuffer.toString("base64");
-
-    const responseLanguage = language === "bn" ? "Bengali (Bangla)" : "English";
-
+    // AI Prompt
     const prompt = `
 You are an expert agricultural plant pathologist.
+
 Analyze the provided crop leaf image carefully.
 
 Your tasks:
+
 1. Identify the crop/plant if possible.
 2. Identify the most likely disease or condition.
 3. If the plant appears healthy, clearly say that it is healthy.
 4. Do not invent symptoms that are not visible or reasonably inferable.
 5. Provide a confidence score from 0 to 100.
-6. List visible symptoms.
+6. List only the visible or reasonably inferable symptoms.
 7. Provide practical organic treatment.
 8. Provide chemical treatment when appropriate.
 9. Provide prevention recommendations.
-10. Return ONLY the requested JSON structure.
+10. Return ONLY valid JSON.
 11. Do not use Markdown.
 12. Do not add explanations outside JSON.
 13. Every human-readable value must be written in ${responseLanguage}.
 
+Return exactly this JSON structure:
+
+{
+  "disease": "string",
+  "scientificName": "string",
+  "confidence": 0,
+  "symptoms": ["string"],
+  "organicTreatment": ["string"],
+  "chemicalTreatment": ["string"],
+  "prevention": ["string"]
+}
+
 The response language is ${responseLanguage}.
 `;
 
-    const responseSchema = {
-      type: "object",
-      properties: {
-        disease: {
-          type: "string",
-          description: "Most likely crop disease or condition",
-        },
-        scientificName: {
-          type: "string",
-          description: "Scientific name of the disease or pathogen",
-        },
-        confidence: {
-          type: "number",
-          description: "Confidence score from 0 to 100",
-        },
-        symptoms: {
-          type: "array",
-          items: { type: "string" },
-          description: "Visible symptoms detected in the image",
-        },
-        organicTreatment: {
-          type: "array",
-          items: { type: "string" },
-          description: "Recommended organic treatment methods",
-        },
-        chemicalTreatment: {
-          type: "array",
-          items: { type: "string" },
-          description: "Recommended chemical treatment methods",
-        },
-        prevention: {
-          type: "array",
-          items: { type: "string" },
-          description: "Disease prevention recommendations",
-        },
-      },
-      required: [
-        "disease",
-        "scientificName",
-        "confidence",
-        "symptoms",
-        "organicTreatment",
-        "chemicalTreatment",
-        "prevention",
-      ],
-    };
-
-    const response = await generateDiagnosis({
-      contents: [
+    
+    const completion = await groq.chat.completions.create({
+      messages: [
         {
           role: "user",
-          parts: [
-            { text: prompt },
+          content: [
             {
-              inlineData: {
-                mimeType,
-                data: base64Image,
+              type: "text",
+              text: prompt,
+            },
+            {
+              type: "image_url",
+              image_url: {
+                url: fastImageUrl,
               },
             },
           ],
         },
       ],
-      config: {
-        responseMimeType: "application/json",
-        responseSchema,
-      },
+      model: "qwen/qwen3.8-27b",
     });
 
-    const diagnosis = JSON.parse(response.text);
+    const text =
+      completion.choices[0]?.message?.content;
+
+    if (!text) {
+      throw new Error("No response generated from AI");
+    }
+
+    console.log("AI Diagnosis Response:", text);
+
+    // Remove possible Markdown code fences if AI accidentally returns them
+    const cleanedText = text
+      .replace(/^```json\s*/i, "")
+      .replace(/^```\s*/i, "")
+      .replace(/\s*```$/i, "")
+      .trim();
+
+    let diagnosis;
+
+    try {
+      diagnosis = JSON.parse(cleanedText);
+    } catch (parseError) {
+      console.error(
+        "Failed to parse AI JSON:",
+        cleanedText
+      );
+
+      throw new Error(
+        "AI returned an invalid JSON response"
+      );
+    }
 
     // Save diagnosis result to PostgreSQL
     const dbQuery = `
-      INSERT INTO crop_diagnoses 
-(image_url, language, disease, scientific_name, confidence, symptoms, organic_treatment, chemical_treatment, prevention)
+      INSERT INTO crop_diagnoses
+      (
+        image_url,
+        language,
+        disease,
+        scientific_name,
+        confidence,
+        symptoms,
+        organic_treatment,
+        chemical_treatment,
+        prevention
+      )
       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
       RETURNING *;
     `;
@@ -405,28 +345,39 @@ The response language is ${responseLanguage}.
       JSON.stringify(diagnosis.prevention),
     ];
 
-    const savedRecord = await pool.query(dbQuery, dbValues);
+    const savedRecord = await pool.query(
+      dbQuery,
+      dbValues
+    );
 
     return res.json({
       success: true,
       result: diagnosis,
       recordId: savedRecord.rows[0].id,
     });
+
   } catch (error) {
-    console.error("Gemini Diagnosis Error:", error);
+    console.error(
+      "Groq Diagnosis Error:",
+      error
+    );
 
     if (error.status === 429) {
       return res.status(429).json({
         success: false,
-        message: "AI diagnosis limit has been reached. Please try again later.",
+        message:
+          "AI diagnosis limit has been reached. Please try again later.",
       });
     }
+
     if (error.status === 503) {
       return res.status(503).json({
         success: false,
-        message: "AI service is temporarily busy. Please try again in a moment.",
+        message:
+          "AI service is temporarily busy. Please try again in a moment.",
       });
     }
+
     return res.status(500).json({
       success: false,
       message: "Diagnosis failed",
@@ -434,6 +385,7 @@ The response language is ${responseLanguage}.
     });
   }
 });
+
 
 app.get("/api/diagnose/history", async (req,res) => {
   try {
