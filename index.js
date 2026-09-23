@@ -9,6 +9,7 @@ app.use(cors());
 app.use(express.json());
 const axios = require("axios");
 const cheerio = require("cheerio");
+const {Groq} = require('groq-sdk')
 const http = require("http");
 const { Server } = require("socket.io");
 const server = http.createServer(app);
@@ -17,6 +18,52 @@ const io = new Server(server, {
     origin: "*",
     methods: ["GET", "POST"],
   },
+});
+
+const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+
+app.post('/api/aiAnswer', async (req, res) => {
+  try {
+    const { question, imageUrl } = req.body;
+
+    if (!question && !imageUrl) {
+      return res.status(400).json({ message: 'Question or image is required' });
+    }
+
+    const content = [];
+
+    if (question) {
+      content.push({ type: 'text', text: question });
+    }
+
+    if (imageUrl) {
+      content.push({
+        type: 'image_url',
+        image_url: { url: imageUrl }
+      });
+    }
+
+    const modelToUse = imageUrl 
+      ? 'qwen/qwen3.8-27b' 
+      : 'openai/gpt-oss-20b';
+
+    const completion = await groq.chat.completions.create({
+      messages: [
+        {
+          role: 'user',
+          content: content
+        }
+      ],
+      model: modelToUse
+    });
+
+    const aiResponse = completion.choices[0]?.message?.content || 'No response generated.';
+
+    res.status(200).json({ result: aiResponse });
+  } catch (error) {
+    console.error('Groq API Error:', error);
+    res.status(500).json({ message: error.message || 'Internal Server Error' });
+  }
 });
 
 app.get("/api/crop-calendar", (req, res) => {
