@@ -66,6 +66,442 @@ app.post('/api/aiAnswer', async (req, res) => {
   }
 });
 
+app.post("/api/soil", async (req, res) => {
+  try {
+    const { imageUrl, language = "bn" } = req.body;
+
+    if (!imageUrl) {
+      return res.status(400).json({
+        success: false,
+        message: "Image URL is required",
+      });
+    }
+
+    const fastImageUrl = imageUrl.replace(
+      "/upload/",
+      "/upload/w_600,q_auto,f_auto/"
+    );
+
+    console.log("Optimized image URL:", fastImageUrl);
+
+    const imageResponse = await fetch(fastImageUrl);
+
+    if (!imageResponse.ok) {
+      throw new Error("Could not download image from Cloudinary");
+    }
+
+    const imageBuffer = Buffer.from(await imageResponse.arrayBuffer());
+    const mimeType = imageResponse.headers.get("content-type") || "image/jpeg";
+    const base64Image = imageBuffer.toString("base64");
+
+    const responseLanguage = language === "bn" ? "Bengali (Bangla)" : "English";
+    
+    const modelToUse =  'qwen/qwen3.8-27b';
+
+    const prompt = `
+You are an expert soil scientist and agricultural chemist.
+Analyze the provided image of soil carefully.
+
+Your tasks:
+1. Identify the soil type (e.g., Clay, Sandy, Loamy, Silt, Peat, Chalky).
+2. Estimate soil health indicators (texture, moisture, organic matter level, color).
+3. Estimate approximate pH range and NPK (Nitrogen, Phosphorus, Potassium) status based on visual characteristics.
+4. Recommend suitable crops or plants for this soil type.
+5. Provide actionable recommendations to improve soil fertility and structure.
+6. Provide a confidence score from 0 to 100.
+7. Return ONLY the requested JSON structure.
+8. Do not use Markdown.
+9. Do not add explanations outside JSON.
+10. Every human-readable value must be written in ${responseLanguage}.
+
+The response language is ${responseLanguage}.
+`;
+
+    const responseSchema = {
+      type: "object",
+      properties: {
+        soilType: {
+          type: "string",
+          description: "Primary category or type of the soil",
+        },
+        confidence: {
+          type: "number",
+          description: "Confidence score from 0 to 100",
+        },
+        estimatedpH: {
+          type: "string",
+          description: "Estimated pH range (e.g., 6.0 - 6.5)",
+        },
+        moistureLevel: {
+          type: "string",
+          description: "Visual moisture condition (e.g., Dry, Moist, Waterlogged)",
+        },
+        organicMatterContent: {
+          type: "string",
+          description:
+            "Estimated organic matter content (e.g., Low, Medium, High)",
+        },
+        suitableCrops: {
+          type: "array",
+          items: { type: "string" },
+          description: "List of crops suitable for this soil",
+        },
+        soilImprovements: {
+          type: "array",
+          items: { type: "string" },
+          description:
+            "Recommended organic/fertilizer actions to improve soil quality",
+        },
+        characteristics: {
+          type: "array",
+          items: { type: "string" },
+          description: "Key visual features observed (color, texture, compaction)",
+        },
+      },
+      required: [
+        "soilType",
+        "confidence",
+        "estimatedpH",
+        "moistureLevel",
+        "organicMatterContent",
+        "suitableCrops",
+        "soilImprovements",
+        "characteristics",
+      ],
+    };
+
+    const response =  await groq.chat.completions.create({
+      contents: [
+        {
+          role: "user",
+          parts: [
+            { text: prompt },
+            {
+              inlineData: {
+                mimeType,
+                data: base64Image,
+              },
+            },
+          ],
+        },
+      ],
+      model: modelToUse,
+      config: {
+        responseMimeType: "application/json",
+        responseSchema,
+      },
+    });
+
+    const soil = JSON.parse(response.text);
+
+    const dbQuery = `
+      INSERT INTO soil_analyses 
+(image_url, language, soil_type, confidence, estimated_ph, moisture_level, organic_matter_content, suitable_crops, soil_improvements, characteristics)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+      RETURNING *;
+    `;
+
+    const dbValues = [
+      imageUrl,
+      language,
+      soil.soilType,
+      soil.confidence,
+      soil.estimatedpH,
+      soil.moistureLevel,
+      soil.organicMatterContent,
+      JSON.stringify(soil.suitableCrops),
+      JSON.stringify(soil.soilImprovements),
+      JSON.stringify(soil.characteristics),
+    ];
+
+    const savedRecord = await pool.query(dbQuery, dbValues);
+
+    return res.json({
+      success: true,
+      result: soil,
+      recordId: savedRecord.rows[0].id,
+    });
+  } catch (error) {
+    console.error("Gemini Soil Analysis Error:", error);
+
+    if (error.status === 429) {
+      return res.status(429).json({
+        success: false,
+        message:
+          "AI soil analysis limit has been reached. Please try again later.",
+      });
+    }
+    if (error.status === 503) {
+      return res.status(503).json({
+        success: false,
+        message: "AI service is temporarily busy. Please try again in a moment.",
+      });
+    }
+    return res.status(500).json({
+      success: false,
+      message: "Soil analysis failed",
+      error: error.message,
+    });
+  }
+});
+
+app.get("/api/soil/history", async (req,res) => {
+  try {
+    const result = await pool.query(
+      "SELECT * FROM soil_analyses ORDER BY created_at DESC LIMIT 20"
+    );
+    res.json({
+      success: true,
+      history: result.rows,
+    });
+  } catch (error) {
+    console.error("Error fetching soil history:", error);
+    res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
+const { GoogleGenAI } = require("@google/genai");
+
+const ai = new GoogleGenAI({
+  apiKey: process.env.GEMINI_API_KEY,
+});
+
+// Sleep Helper
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Gemini Diagnosis with Retry + Fallback
+async function generateDiagnosis(requestData) {
+  const models = [
+    "gemini-3.8-flash",
+    "gemini-3.7-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash-lite",
+  ];
+
+  let lastError = null;
+  for (const model of models) {
+    const maxRetries = 1;
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        console.log(`Gemini ${model} - attempt ${attempt}`);
+        const response = await ai.models.generateContent({
+          ...requestData,
+          model,
+        });
+        console.log(`Gemini diagnosis successful with: ${model}`);
+        return response;
+      } catch (error) {
+        lastError = error;
+  console.error(`Gemini ${model} attempt ${attempt} failed:`, error.message);
+        if (error.status === 429) {
+          console.log(`${model} returned 429. Moving to fallback model...`);
+          break;
+        }
+        if (error.status === 503) {
+          if (attempt === maxRetries) {
+            console.log(`${model} is still busy. Moving to fallback model...`);
+            break;
+          }
+          const delay = 1500 * Math.pow(2, attempt - 1);
+          console.log(`Retrying ${model} in ${delay / 1000} seconds...`);
+          await sleep(delay);
+          continue;
+        }
+        throw error;
+      }
+    }
+  }
+  throw lastError || new Error("All Gemini models failed");
+}
+
+// AI Crop Disease Diagnosis
+app.post("/api/diagnose", async (req, res) => {
+  try {
+    const { imageUrl, language = "bn" } = req.body;
+
+    if (!imageUrl) {
+      return res.status(400).json({
+        success: false,
+        message: "Image URL is required",
+      });
+    }
+
+    const fastImageUrl = imageUrl.replace(
+      "/upload/",
+      "/upload/w_600,q_auto,f_auto/"
+    );
+
+    console.log("Optimized image URL:", fastImageUrl);
+
+    const imageResponse = await fetch(fastImageUrl);
+
+    if (!imageResponse.ok) {
+      throw new Error("Could not download image from Cloudinary");
+    }
+
+    const imageBuffer = Buffer.from(await imageResponse.arrayBuffer());
+    const mimeType = imageResponse.headers.get("content-type") || "image/jpeg";
+    const base64Image = imageBuffer.toString("base64");
+
+    const responseLanguage = language === "bn" ? "Bengali (Bangla)" : "English";
+
+    const prompt = `
+You are an expert agricultural plant pathologist.
+Analyze the provided crop leaf image carefully.
+
+Your tasks:
+1. Identify the crop/plant if possible.
+2. Identify the most likely disease or condition.
+3. If the plant appears healthy, clearly say that it is healthy.
+4. Do not invent symptoms that are not visible or reasonably inferable.
+5. Provide a confidence score from 0 to 100.
+6. List visible symptoms.
+7. Provide practical organic treatment.
+8. Provide chemical treatment when appropriate.
+9. Provide prevention recommendations.
+10. Return ONLY the requested JSON structure.
+11. Do not use Markdown.
+12. Do not add explanations outside JSON.
+13. Every human-readable value must be written in ${responseLanguage}.
+
+The response language is ${responseLanguage}.
+`;
+
+    const responseSchema = {
+      type: "object",
+      properties: {
+        disease: {
+          type: "string",
+          description: "Most likely crop disease or condition",
+        },
+        scientificName: {
+          type: "string",
+          description: "Scientific name of the disease or pathogen",
+        },
+        confidence: {
+          type: "number",
+          description: "Confidence score from 0 to 100",
+        },
+        symptoms: {
+          type: "array",
+          items: { type: "string" },
+          description: "Visible symptoms detected in the image",
+        },
+        organicTreatment: {
+          type: "array",
+          items: { type: "string" },
+          description: "Recommended organic treatment methods",
+        },
+        chemicalTreatment: {
+          type: "array",
+          items: { type: "string" },
+          description: "Recommended chemical treatment methods",
+        },
+        prevention: {
+          type: "array",
+          items: { type: "string" },
+          description: "Disease prevention recommendations",
+        },
+      },
+      required: [
+        "disease",
+        "scientificName",
+        "confidence",
+        "symptoms",
+        "organicTreatment",
+        "chemicalTreatment",
+        "prevention",
+      ],
+    };
+
+    const response = await generateDiagnosis({
+      contents: [
+        {
+          role: "user",
+          parts: [
+            { text: prompt },
+            {
+              inlineData: {
+                mimeType,
+                data: base64Image,
+              },
+            },
+          ],
+        },
+      ],
+      config: {
+        responseMimeType: "application/json",
+        responseSchema,
+      },
+    });
+
+    const diagnosis = JSON.parse(response.text);
+
+    // Save diagnosis result to PostgreSQL
+    const dbQuery = `
+      INSERT INTO crop_diagnoses 
+(image_url, language, disease, scientific_name, confidence, symptoms, organic_treatment, chemical_treatment, prevention)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      RETURNING *;
+    `;
+
+    const dbValues = [
+      imageUrl,
+      language,
+      diagnosis.disease,
+      diagnosis.scientificName,
+      diagnosis.confidence,
+      JSON.stringify(diagnosis.symptoms),
+      JSON.stringify(diagnosis.organicTreatment),
+      JSON.stringify(diagnosis.chemicalTreatment),
+      JSON.stringify(diagnosis.prevention),
+    ];
+
+    const savedRecord = await pool.query(dbQuery, dbValues);
+
+    return res.json({
+      success: true,
+      result: diagnosis,
+      recordId: savedRecord.rows[0].id,
+    });
+  } catch (error) {
+    console.error("Gemini Diagnosis Error:", error);
+
+    if (error.status === 429) {
+      return res.status(429).json({
+        success: false,
+        message: "AI diagnosis limit has been reached. Please try again later.",
+      });
+    }
+    if (error.status === 503) {
+      return res.status(503).json({
+        success: false,
+        message: "AI service is temporarily busy. Please try again in a moment.",
+      });
+    }
+    return res.status(500).json({
+      success: false,
+      message: "Diagnosis failed",
+      error: error.message,
+    });
+  }
+});
+
+app.get("/api/diagnose/history", async (req,res) => {
+  try {
+    const result = await pool.query(
+      "SELECT * FROM crop_diagnoses ORDER BY created_at DESC LIMIT 20"
+    );
+    res.json({
+      success: true,
+      history: result.rows,
+    });
+  } catch (error) {
+    console.error("Error fetching diagnosis history:", error);
+    res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
 app.get("/api/crop-calendar", (req, res) => {
   try {
     res.status(200).json({
@@ -433,438 +869,6 @@ app.patch("/user/:email", async (req, res) => {
   }
 });
 
-const { GoogleGenAI } = require("@google/genai");
-
-const ai = new GoogleGenAI({
-  apiKey: process.env.GEMINI_API_KEY,
-});
-
-// Sleep Helper
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-// Gemini Diagnosis with Retry + Fallback
-async function generateDiagnosis(requestData) {
-  const models = [
-    "gemini-3.8-flash",
-    "gemini-3.7-flash",
-    "gemini-3.6-flash",
-    "gemini-3.5-flash-lite",
-  ];
-
-  let lastError = null;
-  for (const model of models) {
-    const maxRetries = 1;
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
-      try {
-        console.log(`Gemini ${model} - attempt ${attempt}`);
-        const response = await ai.models.generateContent({
-          ...requestData,
-          model,
-        });
-        console.log(`Gemini diagnosis successful with: ${model}`);
-        return response;
-      } catch (error) {
-        lastError = error;
-  console.error(`Gemini ${model} attempt ${attempt} failed:`, error.message);
-        if (error.status === 429) {
-          console.log(`${model} returned 429. Moving to fallback model...`);
-          break;
-        }
-        if (error.status === 503) {
-          if (attempt === maxRetries) {
-            console.log(`${model} is still busy. Moving to fallback model...`);
-            break;
-          }
-          const delay = 1500 * Math.pow(2, attempt - 1);
-          console.log(`Retrying ${model} in ${delay / 1000} seconds...`);
-          await sleep(delay);
-          continue;
-        }
-        throw error;
-      }
-    }
-  }
-  throw lastError || new Error("All Gemini models failed");
-}
-
-// AI Crop Disease Diagnosis
-app.post("/api/diagnose", async (req, res) => {
-  try {
-    const { imageUrl, language = "bn" } = req.body;
-
-    if (!imageUrl) {
-      return res.status(400).json({
-        success: false,
-        message: "Image URL is required",
-      });
-    }
-
-    const fastImageUrl = imageUrl.replace(
-      "/upload/",
-      "/upload/w_600,q_auto,f_auto/"
-    );
-
-    console.log("Optimized image URL:", fastImageUrl);
-
-    const imageResponse = await fetch(fastImageUrl);
-
-    if (!imageResponse.ok) {
-      throw new Error("Could not download image from Cloudinary");
-    }
-
-    const imageBuffer = Buffer.from(await imageResponse.arrayBuffer());
-    const mimeType = imageResponse.headers.get("content-type") || "image/jpeg";
-    const base64Image = imageBuffer.toString("base64");
-
-    const responseLanguage = language === "bn" ? "Bengali (Bangla)" : "English";
-
-    const prompt = `
-You are an expert agricultural plant pathologist.
-Analyze the provided crop leaf image carefully.
-
-Your tasks:
-1. Identify the crop/plant if possible.
-2. Identify the most likely disease or condition.
-3. If the plant appears healthy, clearly say that it is healthy.
-4. Do not invent symptoms that are not visible or reasonably inferable.
-5. Provide a confidence score from 0 to 100.
-6. List visible symptoms.
-7. Provide practical organic treatment.
-8. Provide chemical treatment when appropriate.
-9. Provide prevention recommendations.
-10. Return ONLY the requested JSON structure.
-11. Do not use Markdown.
-12. Do not add explanations outside JSON.
-13. Every human-readable value must be written in ${responseLanguage}.
-
-The response language is ${responseLanguage}.
-`;
-
-    const responseSchema = {
-      type: "object",
-      properties: {
-        disease: {
-          type: "string",
-          description: "Most likely crop disease or condition",
-        },
-        scientificName: {
-          type: "string",
-          description: "Scientific name of the disease or pathogen",
-        },
-        confidence: {
-          type: "number",
-          description: "Confidence score from 0 to 100",
-        },
-        symptoms: {
-          type: "array",
-          items: { type: "string" },
-          description: "Visible symptoms detected in the image",
-        },
-        organicTreatment: {
-          type: "array",
-          items: { type: "string" },
-          description: "Recommended organic treatment methods",
-        },
-        chemicalTreatment: {
-          type: "array",
-          items: { type: "string" },
-          description: "Recommended chemical treatment methods",
-        },
-        prevention: {
-          type: "array",
-          items: { type: "string" },
-          description: "Disease prevention recommendations",
-        },
-      },
-      required: [
-        "disease",
-        "scientificName",
-        "confidence",
-        "symptoms",
-        "organicTreatment",
-        "chemicalTreatment",
-        "prevention",
-      ],
-    };
-
-    const response = await generateDiagnosis({
-      contents: [
-        {
-          role: "user",
-          parts: [
-            { text: prompt },
-            {
-              inlineData: {
-                mimeType,
-                data: base64Image,
-              },
-            },
-          ],
-        },
-      ],
-      config: {
-        responseMimeType: "application/json",
-        responseSchema,
-      },
-    });
-
-    const diagnosis = JSON.parse(response.text);
-
-    // Save diagnosis result to PostgreSQL
-    const dbQuery = `
-      INSERT INTO crop_diagnoses 
-(image_url, language, disease, scientific_name, confidence, symptoms, organic_treatment, chemical_treatment, prevention)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-      RETURNING *;
-    `;
-
-    const dbValues = [
-      imageUrl,
-      language,
-      diagnosis.disease,
-      diagnosis.scientificName,
-      diagnosis.confidence,
-      JSON.stringify(diagnosis.symptoms),
-      JSON.stringify(diagnosis.organicTreatment),
-      JSON.stringify(diagnosis.chemicalTreatment),
-      JSON.stringify(diagnosis.prevention),
-    ];
-
-    const savedRecord = await pool.query(dbQuery, dbValues);
-
-    return res.json({
-      success: true,
-      result: diagnosis,
-      recordId: savedRecord.rows[0].id,
-    });
-  } catch (error) {
-    console.error("Gemini Diagnosis Error:", error);
-
-    if (error.status === 429) {
-      return res.status(429).json({
-        success: false,
-        message: "AI diagnosis limit has been reached. Please try again later.",
-      });
-    }
-    if (error.status === 503) {
-      return res.status(503).json({
-        success: false,
-        message: "AI service is temporarily busy. Please try again in a moment.",
-      });
-    }
-    return res.status(500).json({
-      success: false,
-      message: "Diagnosis failed",
-      error: error.message,
-    });
-  }
-});
-
-app.get("/api/diagnose/history", async (req,res) => {
-  try {
-    const result = await pool.query(
-      "SELECT * FROM crop_diagnoses ORDER BY created_at DESC LIMIT 20"
-    );
-    res.json({
-      success: true,
-      history: result.rows,
-    });
-  } catch (error) {
-    console.error("Error fetching diagnosis history:", error);
-    res.status(500).json({ success: false, message: "Server error" });
-  }
-});
-
-app.post("/api/soil", async (req, res) => {
-  try {
-    const { imageUrl, language = "bn" } = req.body;
-
-    if (!imageUrl) {
-      return res.status(400).json({
-        success: false,
-        message: "Image URL is required",
-      });
-    }
-
-    const fastImageUrl = imageUrl.replace(
-      "/upload/",
-      "/upload/w_600,q_auto,f_auto/"
-    );
-
-    console.log("Optimized image URL:", fastImageUrl);
-
-    const imageResponse = await fetch(fastImageUrl);
-
-    if (!imageResponse.ok) {
-      throw new Error("Could not download image from Cloudinary");
-    }
-
-    const imageBuffer = Buffer.from(await imageResponse.arrayBuffer());
-    const mimeType = imageResponse.headers.get("content-type") || "image/jpeg";
-    const base64Image = imageBuffer.toString("base64");
-
-    const responseLanguage = language === "bn" ? "Bengali (Bangla)" : "English";
-
-    const prompt = `
-You are an expert soil scientist and agricultural chemist.
-Analyze the provided image of soil carefully.
-
-Your tasks:
-1. Identify the soil type (e.g., Clay, Sandy, Loamy, Silt, Peat, Chalky).
-2. Estimate soil health indicators (texture, moisture, organic matter level, color).
-3. Estimate approximate pH range and NPK (Nitrogen, Phosphorus, Potassium) status based on visual characteristics.
-4. Recommend suitable crops or plants for this soil type.
-5. Provide actionable recommendations to improve soil fertility and structure.
-6. Provide a confidence score from 0 to 100.
-7. Return ONLY the requested JSON structure.
-8. Do not use Markdown.
-9. Do not add explanations outside JSON.
-10. Every human-readable value must be written in ${responseLanguage}.
-
-The response language is ${responseLanguage}.
-`;
-
-    const responseSchema = {
-      type: "object",
-      properties: {
-        soilType: {
-          type: "string",
-          description: "Primary category or type of the soil",
-        },
-        confidence: {
-          type: "number",
-          description: "Confidence score from 0 to 100",
-        },
-        estimatedpH: {
-          type: "string",
-          description: "Estimated pH range (e.g., 6.0 - 6.5)",
-        },
-        moistureLevel: {
-          type: "string",
-          description: "Visual moisture condition (e.g., Dry, Moist, Waterlogged)",
-        },
-        organicMatterContent: {
-          type: "string",
-          description:
-            "Estimated organic matter content (e.g., Low, Medium, High)",
-        },
-        suitableCrops: {
-          type: "array",
-          items: { type: "string" },
-          description: "List of crops suitable for this soil",
-        },
-        soilImprovements: {
-          type: "array",
-          items: { type: "string" },
-          description:
-            "Recommended organic/fertilizer actions to improve soil quality",
-        },
-        characteristics: {
-          type: "array",
-          items: { type: "string" },
-          description: "Key visual features observed (color, texture, compaction)",
-        },
-      },
-      required: [
-        "soilType",
-        "confidence",
-        "estimatedpH",
-        "moistureLevel",
-        "organicMatterContent",
-        "suitableCrops",
-        "soilImprovements",
-        "characteristics",
-      ],
-    };
-
-    const response = await generateDiagnosis({
-      contents: [
-        {
-          role: "user",
-          parts: [
-            { text: prompt },
-            {
-              inlineData: {
-                mimeType,
-                data: base64Image,
-              },
-            },
-          ],
-        },
-      ],
-      config: {
-        responseMimeType: "application/json",
-        responseSchema,
-      },
-    });
-
-    const soil = JSON.parse(response.text);
-
-    const dbQuery = `
-      INSERT INTO soil_analyses 
-(image_url, language, soil_type, confidence, estimated_ph, moisture_level, organic_matter_content, suitable_crops, soil_improvements, characteristics)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-      RETURNING *;
-    `;
-
-    const dbValues = [
-      imageUrl,
-      language,
-      soil.soilType,
-      soil.confidence,
-      soil.estimatedpH,
-      soil.moistureLevel,
-      soil.organicMatterContent,
-      JSON.stringify(soil.suitableCrops),
-      JSON.stringify(soil.soilImprovements),
-      JSON.stringify(soil.characteristics),
-    ];
-
-    const savedRecord = await pool.query(dbQuery, dbValues);
-
-    return res.json({
-      success: true,
-      result: soil,
-      recordId: savedRecord.rows[0].id,
-    });
-  } catch (error) {
-    console.error("Gemini Soil Analysis Error:", error);
-
-    if (error.status === 429) {
-      return res.status(429).json({
-        success: false,
-        message:
-          "AI soil analysis limit has been reached. Please try again later.",
-      });
-    }
-    if (error.status === 503) {
-      return res.status(503).json({
-        success: false,
-        message: "AI service is temporarily busy. Please try again in a moment.",
-      });
-    }
-    return res.status(500).json({
-      success: false,
-      message: "Soil analysis failed",
-      error: error.message,
-    });
-  }
-});
-
-app.get("/api/soil/history", async (req,res) => {
-  try {
-    const result = await pool.query(
-      "SELECT * FROM soil_analyses ORDER BY created_at DESC LIMIT 20"
-    );
-    res.json({
-      success: true,
-      history: result.rows,
-    });
-  } catch (error) {
-    console.error("Error fetching soil history:", error);
-    res.status(500).json({ success: false, message: "Server error" });
-  }
-});
 
 app.get("/api/weather", async (req, res) => {
   try {
