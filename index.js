@@ -68,6 +68,12 @@ app.post('/api/aiAnswer', async (req, res) => {
 
 app.post("/api/soil", async (req, res) => {
   try {
+    console.log("SOIL REQUEST BODY:", req.body);
+    console.log(
+      "SOIL CONTENT TYPE:",
+      req.headers["content-type"]
+    );
+
     const { imageUrl, language = "bn" } = req.body;
 
     if (!imageUrl) {
