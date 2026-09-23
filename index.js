@@ -1266,7 +1266,9 @@ app.get("/api/conversations/:farmerId/:expertId/messages",
     }});
 
 const PORT = process.env.PORT || 5000;
-
+server.get("/", (req, res) => {
+  res.send("Server Running");
+});
 server.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
