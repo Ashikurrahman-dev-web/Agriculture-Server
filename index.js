@@ -15,8 +15,9 @@ const { Server } = require("socket.io");
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: "*",
+    origin: "https://agriculture-delta-ochre.vercel.app",
     methods: ["GET", "POST"],
+    credentials: true,
   },
 });
 
